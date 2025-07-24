@@ -12,6 +12,8 @@ import pyproj
 from pyproj import Transformer
 import matplotlib.pyplot as plt
 import scipy.stats
+from scipy.interpolate import interp1d, PchipInterpolator
+from bolides import ShowerDataFrame
 
 fov = None  # global variable
 min_time = None
@@ -65,7 +67,48 @@ def make_bdf(boundary):
     bdf_boundary = bdf.filter_boundary(boundary=[boundary])
     # bdf_boundary.add_website_data()
     bdf_boundary = bdf_boundary[['datetime', 'latitude', 'longitude']]
-    bdf_final = bdf_boundary
+    bdf_final = bdf_boundary.copy()
+    bdf_final['time_seconds'] = (bdf_boundary.iloc[:, 0] - bdf_boundary.iloc[:, 0].min()).dt.total_seconds()
+    bdf_final = bdf_final[['time_seconds', 'latitude', 'longitude', 'datetime']]
+    return bdf_final
+
+def make_bdf_showers(bdf, sdf, n):
+    """
+    Creates a dataframe of bolide data filtering out n showers with columns: time in seconds (from the earliest observation), latitude, longitude (in degrees)
+    
+    Parameters
+    ----------
+    boundary: str or iterable with multiple strings
+        Specifies the boundaries desired.
+    - ``'goes'``: Combined FOV of the GLM aboard GOES-16 and GOES-17
+    - ``'goes-w'``: GOES-West position GLM FOV, currently corresponding to GOES-17.
+      Note that this combines the inverted and non-inverted FOVs.
+    - ``'goes-e'``: GOES-East position GLM FOV, currently corresopnding to GOES-16.
+    - ``'goes-w-ni'``: GOES-West position GLM FOV, when GOES-17 is not inverted (summer).
+    - ``'goes-w-i'``: GOES-West position GLM FOV, when GOES-17 is inverted (winter).
+    - ``'goes-17-89.5'``: GOES-17 GLM FOV when it was in its checkout orbit.
+    - ``'fy4a'``: Combined FOV of the Fengyun-4A LMI, in both North and South configurations.
+    - ``'fy4a-n'``: Fengyun-4A LMI FOV when in the North configuration (summer).
+    - ``'fy4a-s'``: Fengyun-4A LMI FOV when in the South configuration (winter).
+    - ``'gmn-25km'``: Combined FOV of all Global Meteor Network stations at 25km detection altitude.
+    - ``'gmn-70km'``: Combined FOV of all Global Meteor Network stations at 70km detection altitude.
+    - ``'gmn-100km'``: Combined FOV of all Global Meteor Network stations at 100km detection altitude.
+
+    Returns
+    -------
+    `~BolideDataFrame`
+            The filtered `~BolideDataFrame`
+    """
+
+    # filter fastest showers
+    codes = sdf.fastest_showers(n)['Code'].values
+    if n == 0:
+        bdf_boundary = bdf.copy()
+    else:
+        bdf_boundary = bdf.filter_shower(codes, exclude=True)
+    
+    bdf_boundary = bdf_boundary[['datetime', 'latitude', 'longitude']]
+    bdf_final = bdf_boundary.copy()
     bdf_final['time_seconds'] = (bdf_boundary.iloc[:, 0] - bdf_boundary.iloc[:, 0].min()).dt.total_seconds()
     bdf_final = bdf_final[['time_seconds', 'latitude', 'longitude', 'datetime']]
     return bdf_final
@@ -274,7 +317,7 @@ def montecarlo(len_bdf, poly, stereo=False, just_stereo=False):
     if just_stereo and not stereo:
         raise ValueError("just_stereo can only be True if stereo is also True.")
 
-    while len(accepted_lats) < len_bdf:
+    while len(accepted_lats) < len_bdf: # uncomment to use the same number of samples as bolides
         lat = np.random.uniform(-90, 90)
         lon = np.random.uniform(-180, 180)
         if just_stereo: # only those in stereo region and within poly
@@ -289,8 +332,6 @@ def montecarlo(len_bdf, poly, stereo=False, just_stereo=False):
             if in_poly(lon, lat, poly) and not in_stereo(lon, lat):
                 accepted_lats.append(lat)
                 accepted_lons.append(lon)
-    print(len(accepted_lats))
-    print(len_bdf)
 
     return np.array(accepted_lons), np.array(accepted_lats)
 
@@ -412,6 +453,223 @@ def lat_cdf(x, y, x1, y1, title):
     plt.show()
 
 
+def compare_pvals_showers():
+    """
+    Compares the CDFs of latitude and longitude for GOES and changes the number of showers filtered out. highest Vg showers filtered first
+
+    Outputs
+    -------
+    - Plots Pvalue for each ks-test comparison of latitudes and longitudes
+    """
+    boundary = 'goes'
+    all_pvalues_lat = []
+    all_pvalues_lon = []
+    bdf = BolideDataFrame(source='glm')
+    # Filter out dates before July 1, 2019
+    bdf_boundary = bdf.filter_boundary(boundary='goes')
+    bdf_boundary = bdf_boundary[bdf_boundary['datetime'] >= pd.Timestamp('2019-07-01', tz='UTC')]
+    
+    sdf = ShowerDataFrame()
+    for i in tqdm(range(0, 61)):
+        if i == 0:
+            bdf = make_bdf_showers(bdf_boundary, sdf, i)
+            lon, lat = create_lonlat(bdf)
+            lat, lat_cdf_vals = cdf(lat)
+            len_bdf = len(lat)
+            # Convert longitudes to [0, 360) for CDF
+            lon_360 = wrap_lon(lon)
+            lon_360, lon_360_cdf = cdf(lon_360)
+        else:
+            lon_360 = lon_3601
+            lat = lat1
+
+
+        bdf1 = make_bdf_showers(bdf_boundary, sdf, i+2)
+        lon1, lat1 = create_lonlat(bdf1)
+        lat1, lat_cdf_vals1 = cdf(lat1)
+        len_bdf1 = len(lat1)
+        # Convert longitudes to [0, 360) for CDF
+        lon_3601 = wrap_lon(lon1)
+        lon_3601, lon_360_cdf1 = cdf(lon_3601)
+
+        # Calculate the KS test
+        # cdf_lat = interp1d(lat_sim, lat_sim_cdf, bounds_error=False, fill_value=(0.0, 1.0))
+        # cdf_lon = interp1d(sim_lon_360, sim_lon_360_cdf, bounds_error=False, fill_value=(0.0, 1.0))
+        # ks_lat = scipy.stats.ks_1samp(lat, cdf_lat)
+        ks_lat = scipy.stats.ks_2samp(lat, lat1)
+        pvalue_lat = ks_lat[1]
+        # ks_lon = scipy.stats.ks_1samp(lon_360, cdf_lon)
+        ks_lon = scipy.stats.ks_2samp(lon_360, lon_3601)
+        pvalue_lon = ks_lon[1]
+        all_pvalues_lat.append(pvalue_lat)
+        all_pvalues_lon.append(pvalue_lon)
+        
+    all_indices = list(range(0, 61))
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
+
+    # Latitude CDF
+    axes[0].plot(all_indices, all_pvalues_lat, marker='.', linestyle='-')
+    axes[0].set_xlabel('Number of showers masked', fontsize=17)
+    axes[0].set_ylabel('p-value', fontsize=17)
+    axes[0].set_title('Change in Latitude CDF', fontsize=18)
+    axes[0].tick_params(axis='both', labelsize=15)
+    axes[0].grid()
+    axes[0].legend(fontsize=17)
+
+    # Longitude CDF
+    axes[1].plot(all_indices, all_pvalues_lon, marker='.', linestyle='-')
+    axes[1].set_xlabel('Number of showers masked', fontsize=17)
+    axes[1].set_ylabel('p-value', fontsize=17)
+    axes[1].set_title('Change in Longitude CDF', fontsize=18)
+    axes[1].tick_params(axis='both', labelsize=15)
+    axes[1].grid()
+    axes[1].legend(fontsize=17)
+
+
+    plt.tight_layout()
+    plt.show()
+    return all_pvalues_lat, all_pvalues_lon
+
+def run_sims(boundary, stereo=False, just_stereo=False):
+    """
+    runs 100 simulations for bolide observations
+
+    Parameters
+    ----------
+    boundary : str
+        The boundary to use for the CDF plot, typically 'goes-w' or 'goes-e'.
+    title : str
+        The title for the plot, typically indicating the boundary and whether stereo mode is used.
+    stereo : bool, optional
+        Whether to use stereo mode (default is False).
+    just_stereo : bool, optional
+        If True, only samples within the stereo region will be used (default is False).
+
+    Returns
+    ----------
+
+
+    """
+    if boundary == 'goes-w':
+        poly = poly_west
+    elif boundary == 'goes-e':
+        poly = poly_east
+    elif boundary == 'goes':
+        poly = fu.get_boundary('goes', collection=True, intersection=False, crs=None)
+        
+    else:
+        raise ValueError("Unsupported boundary. Use 'goes-w', 'goes-e', or 'goes'.")
+    bdf = BolideDataFrame(source='glm')
+    # Filter out dates before July 1, 2019
+    bdf_boundary = bdf.filter_boundary(boundary=boundary)
+    bdf_boundary = bdf_boundary[bdf_boundary['datetime'] >= pd.Timestamp('2019-07-01', tz='UTC')]
+    
+    sdf = ShowerDataFrame()
+    bdf_final = make_bdf_showers(bdf_boundary, sdf, 41)
+            
+
+    lon, lat = create_lonlat(bdf_final)
+
+    if not stereo:
+        # Filter out latitudes and longitudes that are in the stereo region
+        accepted_lats = []
+        accepted_lons = []
+
+        for lat, lon in zip(lat, lon):
+            if not in_stereo(lon, lat):
+                accepted_lats.append(lat)
+                accepted_lons.append(lon)
+    elif just_stereo:
+        # Filter out latitudes and longitudes that are not in the stereo region
+        accepted_lats = []
+        accepted_lons = []
+
+        for lat, lon in zip(lat, lon):
+            if in_stereo(lon, lat):
+                accepted_lats.append(lat)
+                accepted_lons.append(lon)
+    else:
+        # Use all latitudes and longitudes in the stereo region
+        accepted_lats = lat
+        accepted_lons = lon
+
+
+    lat, lat_cdf_vals = cdf(accepted_lats)
+    len_bdf = len(accepted_lats)
+    lon_360 = wrap_lon(accepted_lons)
+    lon_360, lon_360_cdf = cdf(lon_360)
+
+    all_lon_sim = []
+    all_lat_sim = []
+    all_lon_sim_cdf = []
+    all_lat_sim_cdf = []
+    pvals_lon = []
+    pvals_lat = []
+    # Prepare simulated latitudes/longitudes in the stereo region
+    for i in tqdm(range(0, 99)):
+        lon_samples, lat_samples = montecarlo(len_bdf, poly=poly, stereo=stereo, just_stereo=just_stereo)
+
+        lat_sim, lat_sim_cdf = cdf(lat_samples)
+
+        # Convert longitudes to [0, 360) for CDF
+        sim_lon_360 = wrap_lon(lon_samples)
+        sim_lon_360, sim_lon_360_cdf = cdf(sim_lon_360)
+
+        all_lon_sim.append(sim_lon_360)
+        all_lat_sim.append(lat_sim)
+        all_lon_sim_cdf.append(sim_lon_360_cdf)
+        all_lat_sim_cdf.append(lat_sim_cdf)
+
+
+        # ks_lat = scipy.stats.ks_1samp(lat, cdf_lat)
+        ks_lat = scipy.stats.ks_2samp(accepted_lats, lat_sim)
+        pvalue_lat = ks_lat[1]
+        # ks_lon = scipy.stats.ks_1samp(lon_360, cdf_lon)
+        ks_lon = scipy.stats.ks_2samp(lon_360, sim_lon_360)
+        pvalue_lon = ks_lon[1]
+
+        pvals_lat.append(pvalue_lat)
+        pvals_lon.append(pvalue_lon)
+
+    return lon_360, lon_360_cdf, all_lon_sim, all_lon_sim_cdf, pvals_lon, lat, lat_cdf_vals, all_lat_sim, all_lat_sim_cdf, pvals_lat
+
+
+def plot_sims(title, lon_360, lon_360_cdf, all_lon_sim, all_lon_sim_cdf, pvals_lon, lat, lat_cdf_vals, all_lat_sim, all_lat_sim_cdf, pvals_lat):
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+
+    # Latitude CDF
+    axes[0].plot(lat, lat_cdf_vals, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    for i in tqdm(range(len(all_lat_sim))):
+        if i == 0:
+            axes[0].plot(all_lat_sim, all_lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', alpha=.1)
+        else:
+            axes[0].plot(all_lat_sim, all_lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', alpha=.1)
+    axes[0].set_xlabel('Latitude (degrees)', fontsize=17)
+    axes[0].set_ylabel('CDF', fontsize=17)
+    axes[0].set_title('CDF of Latitude: ' + title + '\np-value = ' + str(np.mean(pvals_lat)), fontsize=18)
+    axes[0].tick_params(axis='both', labelsize=15)
+    axes[0].grid()
+    # axes[0].legend(fontsize=17)
+
+    # Longitude CDF
+    axes[1].plot(lon_360, lon_360_cdf, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    for i in tqdm(range(len(all_lon_sim))):
+        if i == 0:
+            axes[1].plot(all_lon_sim[i], all_lon_sim_cdf[i], marker='.', linestyle='-', color='#CC79A7', alpha=.1)
+        else:
+            axes[1].plot(all_lon_sim[i], all_lon_sim_cdf[i], marker='.', linestyle='-', color='#CC79A7', alpha=.1)
+    axes[1].set_xlabel('Longitude (degrees)', fontsize=17)
+    axes[1].set_ylabel('CDF', fontsize=17)
+    axes[1].set_title('CDF of Longitude: ' + title + '\np-value = '+ str(np.mean(pvals_lon)), fontsize=18)
+    axes[1].tick_params(axis='both', labelsize=15)
+    axes[1].grid()
+    # axes[1].legend(fontsize=17)
+
+    plt.tight_layout()
+    plt.show()
+
 
 def plot_cdf(boundary, title, stereo=False, just_stereo=False):
     """
@@ -438,7 +696,15 @@ def plot_cdf(boundary, title, stereo=False, just_stereo=False):
     else:
         raise ValueError("Unsupported boundary. Use 'goes-w', 'goes-e', or 'goes'.")
     
-    bdf_final = make_bdf(boundary)
+    bdf = BolideDataFrame(source='glm')
+    # Filter out dates before July 1, 2019
+    bdf_boundary = bdf.filter_boundary(boundary=boundary)
+    bdf_boundary = bdf_boundary[bdf_boundary['datetime'] >= pd.Timestamp('2019-07-01', tz='UTC')]
+    
+    sdf = ShowerDataFrame()
+    bdf_final = make_bdf_showers(bdf_boundary, sdf, 41)
+            
+
     lon, lat = create_lonlat(bdf_final)
 
     if not stereo:
@@ -480,34 +746,75 @@ def plot_cdf(boundary, title, stereo=False, just_stereo=False):
     sim_lon_360, sim_lon_360_cdf = cdf(sim_lon_360)
 
     # Calculate the KS test
+    cdf_lat = interp1d(lat, lat_cdf_vals, bounds_error=False, fill_value=(0.0, 1.0))
+    cdf_lon = interp1d(lon_360, lon_360_cdf, bounds_error=False, fill_value=(0.0, 1.0))
+    cdf_lat_sim = interp1d(lat_sim, lat_sim_cdf, bounds_error=False, fill_value=(0.0, 1.0))
+    cdf_lon_sim = interp1d(sim_lon_360, sim_lon_360_cdf, bounds_error=False, fill_value=(0.0, 1.0))
+    # ks_lat = scipy.stats.ks_1samp(lat, cdf_lat)
     ks_lat = scipy.stats.ks_2samp(accepted_lats, lat_sim)
     pvalue_lat = ks_lat[1]
-
+    # ks_lon = scipy.stats.ks_1samp(lon_360, cdf_lon)
     ks_lon = scipy.stats.ks_2samp(lon_360, sim_lon_360)
     pvalue_lon = ks_lon[1]
 
+    # indices = np.setdiff1d(np.arange(len(lat)), np.unique(lat, return_index=True)[1])
+    # print(lat[indices])
+    # y_lat = PchipInterpolator(lat, lat_cdf_vals, axis=0)
+    # y_lat_sim = PchipInterpolator(lat_sim, lat_sim_cdf, axis=0)
+    # y_lon_360 = PchipInterpolator(lon_360, lon_360_cdf, axis=0)
+    # y_sim_lon_360 = PchipInterpolator(sim_lon_360, sim_lon_360_cdf, axis=0)
+
+
+
+    dlat = np.gradient(lat_cdf_vals, lat)
+    dlat_sim = np.gradient(lat_sim_cdf, lat_sim)
+    dlon = np.gradient(lon_360_cdf, lon_360)
+    dlon_sim = np.gradient(sim_lon_360_cdf, sim_lon_360)
+
     # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 6), dpi=300)
+    fig, axes = plt.subplots(2, 2, figsize=(16, 16), dpi=300)
 
     # Latitude CDF
-    axes[0].plot(lat, lat_cdf_vals, marker='.', linestyle='-', color='#0072B2', label='Observed')
-    axes[0].plot(lat_sim, lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
-    axes[0].set_xlabel('Latitude (degrees)', fontsize=17)
-    axes[0].set_ylabel('CDF', fontsize=17)
-    axes[0].set_title('CDF of Latitude: ' + title + '\np-value = ' + str(pvalue_lat), fontsize=18)
-    axes[0].tick_params(axis='both', labelsize=15)
-    axes[0].grid()
-    axes[0].legend(fontsize=17)
+    axes[0,0].plot(lat, lat_cdf_vals, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    axes[0,0].plot(lat_sim, lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
+    axes[0,0].set_xlabel('Latitude (degrees)', fontsize=17)
+    axes[0,0].set_ylabel('CDF', fontsize=17)
+    axes[0,0].set_title('CDF of Latitude: ' + title + '\np-value = ' + str(pvalue_lat), fontsize=18)
+    axes[0,0].tick_params(axis='both', labelsize=15)
+    axes[0,0].grid()
+    axes[0,0].legend(fontsize=17)
 
     # Longitude CDF
-    axes[1].plot(lon_360, lon_360_cdf, marker='.', linestyle='-', color='#0072B2', label='Observed')
-    axes[1].plot(sim_lon_360, sim_lon_360_cdf, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
-    axes[1].set_xlabel('Longitude (degrees)', fontsize=17)
-    axes[1].set_ylabel('CDF', fontsize=17)
-    axes[1].set_title('CDF of Longitude: ' + title + '\np-value = '+ str(pvalue_lon), fontsize=18)
-    axes[1].tick_params(axis='both', labelsize=15)
-    axes[1].grid()
-    axes[1].legend(fontsize=17)
+    axes[0, 1].plot(lon_360, lon_360_cdf, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    axes[0, 1].plot(sim_lon_360, sim_lon_360_cdf, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
+    axes[0, 1].set_xlabel('Longitude (degrees)', fontsize=17)
+    axes[0, 1].set_ylabel('CDF', fontsize=17)
+    axes[0, 1].set_title('CDF of Longitude: ' + title + '\np-value = '+ str(pvalue_lon), fontsize=18)
+    axes[0, 1].tick_params(axis='both', labelsize=15)
+    axes[0, 1].grid()
+    axes[0, 1].legend(fontsize=17)
+
+    # Latitude derivative
+    axes[1,0].plot(lat, dlat, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    axes[1,0].plot(lat_sim, dlat_sim, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
+    axes[1,0].set_yscale('log')
+    axes[1,0].set_xlabel('Latitude (degrees)', fontsize=17)
+    axes[1,0].set_ylabel('CDF Slope', fontsize=17)
+    axes[1,0].set_title('CDF Slope of Latitude: ' + title, fontsize=18)
+    axes[1,0].tick_params(axis='both', labelsize=15)
+    axes[1,0].grid()
+    axes[1,0].legend(fontsize=17)
+
+    #Longitude derivative
+    axes[1,1].plot(lon_360, dlon, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    axes[1,1].plot(sim_lon_360, dlon_sim, marker='.', linestyle='-', color='#CC79A7', label='Simulated')
+    axes[1,1].set_yscale('log')
+    axes[1,1].set_xlabel('Longitude (degrees)', fontsize=17)
+    axes[1,1].set_ylabel('CDF Slope', fontsize=17)
+    axes[1,1].set_title('CDF Slope of Longitude: ' + title, fontsize=18)
+    axes[1,1].tick_params(axis='both', labelsize=15)
+    axes[1,1].grid()
+    axes[1,1].legend(fontsize=17)
 
     plt.tight_layout()
     plt.show()
