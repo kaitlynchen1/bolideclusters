@@ -14,6 +14,9 @@ import matplotlib.pyplot as plt
 import scipy.stats
 from scipy.interpolate import interp1d, PchipInterpolator
 from bolides import ShowerDataFrame
+from scipy.stats import binned_statistic
+from scipy.ndimage import gaussian_filter1d
+
 
 fov = None  # global variable
 min_time = None
@@ -634,38 +637,133 @@ def run_sims(boundary, stereo=False, just_stereo=False):
 
     return lon_360, lon_360_cdf, all_lon_sim, all_lon_sim_cdf, pvals_lon, lat, lat_cdf_vals, all_lat_sim, all_lat_sim_cdf, pvals_lat
 
+def interp(all_sim, all_sim_cdf, real_x):
+    # interpolate
+    num_sim = len(all_sim)
+    x_common = np.linspace(real_x.min(), real_x.max(), len(all_sim[0]))  # Common x-grid over [0, 360)
 
+    # Interpolate all CDF curves onto x_common
+    y_interp = np.empty((num_sim, len(x_common)))
+
+    for i in range(num_sim):
+        x = all_sim[i]
+        y = all_sim_cdf[i]
+
+        # Sort x just in case
+        sort_idx = np.argsort(x)
+        x = x[sort_idx]
+        y = y[sort_idx]
+
+        # Interpolate onto common grid
+        f_interp = interp1d(x, y, kind='nearest', bounds_error=False, fill_value=(0.0, 1.0))
+        y_interp[i] = f_interp(x_common)
+
+    return y_interp, x_common
+
+def fast_bin_spectrum(wavelength, flux, bin_width):
+    """
+    Bin spectrum using fixed wavelength bin width (in μm).
+    Much faster than manual looping.
+    """
+    min_wave = np.min(wavelength)
+    max_wave = np.max(wavelength)
+    bins = np.arange(min_wave, max_wave + bin_width, bin_width)
+
+    # Compute mean flux in each bin
+    binned_flux, _, _ = binned_statistic(wavelength, flux, statistic='mean', bins=bins)
+
+    # Compute bin centers
+    bin_centers = 0.5 * (bins[1:] + bins[:-1])
+
+    # Filter out empty bins (NaNs)
+    valid = ~np.isnan(binned_flux)
+    return bin_centers[valid], binned_flux[valid]
 def plot_sims(title, lon_360, lon_360_cdf, all_lon_sim, all_lon_sim_cdf, pvals_lon, lat, lat_cdf_vals, all_lat_sim, all_lat_sim_cdf, pvals_lat):
+    # number of x's per bin
+    n = 5
     # Plot
-    fig, axes = plt.subplots(1, 2, figsize=(16, 8))
+    fig, axes = plt.subplots(2, 2, figsize=(16, 16), dpi=300)
 
     # Latitude CDF
-    axes[0].plot(lat, lat_cdf_vals, marker='.', linestyle='-', color='#0072B2', label='Observed')
-    for i in tqdm(range(len(all_lat_sim))):
-        if i == 0:
-            axes[0].plot(all_lat_sim, all_lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', alpha=.1)
-        else:
-            axes[0].plot(all_lat_sim, all_lat_sim_cdf, marker='.', linestyle='-', color='#CC79A7', alpha=.1)
-    axes[0].set_xlabel('Latitude (degrees)', fontsize=17)
-    axes[0].set_ylabel('CDF', fontsize=17)
-    axes[0].set_title('CDF of Latitude: ' + title + '\np-value = ' + str(np.mean(pvals_lat)), fontsize=18)
-    axes[0].tick_params(axis='both', labelsize=15)
-    axes[0].grid()
-    # axes[0].legend(fontsize=17)
+    axes[0,0].plot(lat, lat_cdf_vals, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    # interpolate the simulated and observations
+    y_interp_lat_sim, x_lat_sim = interp(all_lat_sim, all_lat_sim_cdf, lat)
+    y_interp_lat_obs, x_lat_obs = interp([lat], [lat_cdf_vals], lat)
+    lower_percentile_lat = np.percentile(y_interp_lat_sim, 5, axis=0)
+    upper_percentile_lat = np.percentile(y_interp_lat_sim, 95, axis=0)
+    median_lat = np.percentile(y_interp_lat_sim, 50, axis=0)
+
+    # bin the sims and obs (since inconsistant slopes from point to point)
+    binned_x_median_lat, binned_y_median_lat = fast_bin_spectrum(x_lat_sim, median_lat, n)
+    binned_x_lower_lat, binned_y_lower_lat = fast_bin_spectrum(x_lat_sim, lower_percentile_lat, n)
+    binned_x_upper_lat, binned_y_upper_lat = fast_bin_spectrum(x_lat_sim, upper_percentile_lat, n)
+    binned_x_lat, binned_y_lat = fast_bin_spectrum(x_lat_obs, y_interp_lat_obs[0], n)
+    d_lower_lat = np.gradient(binned_y_lower_lat)
+    d_upper_lat = np.gradient(binned_y_upper_lat)
+    d_median_lat = np.gradient(binned_y_median_lat)
+    dy_lat = np.gradient(binned_y_lat)
+
+    axes[0,0].plot(binned_x_median_lat, binned_y_median_lat, marker='.', linestyle='-', color='#CE619D', label='Simulated median (binned)')
+    axes[0,0].fill_between(x_lat_sim, lower_percentile_lat, upper_percentile_lat, color='#CC79A7', alpha=.5, label='Simulated (middle 90%)')
+    axes[0,0].set_xlabel('Latitude (degrees)', fontsize=17)
+    axes[0,0].set_ylabel('CDF', fontsize=17)
+    axes[0,0].set_title('CDF of Latitude: ' + title + '\np-value = ' + str(np.mean(pvals_lat)), fontsize=18)
+    axes[0,0].tick_params(axis='both', labelsize=15)
+    axes[0,0].grid()
+    axes[0,0].legend(fontsize=17)
+    
+    # Latitude derivative
+    axes[1,0].fill_between(binned_x_lower_lat, d_lower_lat, d_upper_lat, color='#CC79A7', alpha=.5, label='Simulated (binned middle 90%)')
+    axes[1,0].plot(binned_x_median_lat, d_median_lat, marker='.', linestyle='-', color='#CC79A7', label='Simulated median(binned)')
+    axes[1,0].plot(binned_x_lat, dy_lat, marker='.', linestyle='-', color='#0072B2', label='Observed (binned)')
+    axes[1,0].set_xlabel('Latitude (degrees)', fontsize=17)
+    axes[1,0].set_ylabel('CDF Slope', fontsize=17)
+    axes[1,0].set_title('CDF Slope of Latitude: ' + title, fontsize=18)
+    axes[1,0].tick_params(axis='both', labelsize=15)
+    axes[1,0].grid()
+    axes[1,0].legend(fontsize=17)
 
     # Longitude CDF
-    axes[1].plot(lon_360, lon_360_cdf, marker='.', linestyle='-', color='#0072B2', label='Observed')
-    for i in tqdm(range(len(all_lon_sim))):
-        if i == 0:
-            axes[1].plot(all_lon_sim[i], all_lon_sim_cdf[i], marker='.', linestyle='-', color='#CC79A7', alpha=.1)
-        else:
-            axes[1].plot(all_lon_sim[i], all_lon_sim_cdf[i], marker='.', linestyle='-', color='#CC79A7', alpha=.1)
-    axes[1].set_xlabel('Longitude (degrees)', fontsize=17)
-    axes[1].set_ylabel('CDF', fontsize=17)
-    axes[1].set_title('CDF of Longitude: ' + title + '\np-value = '+ str(np.mean(pvals_lon)), fontsize=18)
-    axes[1].tick_params(axis='both', labelsize=15)
-    axes[1].grid()
-    # axes[1].legend(fontsize=17)
+    axes[0, 1].plot(lon_360, lon_360_cdf, marker='.', linestyle='-', color='#0072B2', label='Observed')
+    # interpolate the simulated and observations
+    y_interp_lon_sim, x_lon_sim = interp(all_lon_sim, all_lon_sim_cdf, lon_360)
+    y_interp_lon_obs, x_lon_obs = interp([lon_360], [lon_360_cdf], lon_360)
+    lower_percentile_lon = np.percentile(y_interp_lon_sim, 5, axis=0)
+    upper_percentile_lon = np.percentile(y_interp_lon_sim, 95, axis=0)
+    median_lon = np.percentile(y_interp_lon_sim, 50, axis=0)
+
+    # bin the sims and obs (since inconsistant slopes from point to point)
+    binned_x_median_lon, binned_y_median_lon = fast_bin_spectrum(x_lon_sim, median_lon, n)
+    binned_x_lower_lon, binned_y_lower_lon = fast_bin_spectrum(x_lon_sim, lower_percentile_lon, n)
+    binned_x_upper_lon, binned_y_upper_lon = fast_bin_spectrum(x_lon_sim, upper_percentile_lon, n)
+    binned_x_lon, binned_y_lon = fast_bin_spectrum(x_lon_obs, y_interp_lon_obs[0], n)
+    d_median_lon = np.gradient(binned_y_median_lon)
+    d_lower_lon = np.gradient(binned_y_lower_lon)
+    d_upper_lon = np.gradient(binned_y_upper_lon)
+    dy_lon = np.gradient(binned_y_lon)
+
+    axes[0,1].plot(binned_x_median_lon, binned_y_median_lon, marker='.', linestyle='-', color='#CE619D', label='Simulated median (binned)')
+    axes[0, 1].fill_between(x_lon_sim, lower_percentile_lon, upper_percentile_lon, color='#CC79A7', alpha=.5, label='Simulated (middle 90%)')
+    axes[0, 1].set_xlabel('Longitude (degrees)', fontsize=17)
+    axes[0, 1].set_ylabel('CDF', fontsize=17)
+    axes[0, 1].set_title('CDF of Longitude: ' + title + '\np-value = '+ str(np.mean(pvals_lon)), fontsize=18)
+    axes[0, 1].tick_params(axis='both', labelsize=15)
+    axes[0, 1].grid()
+    axes[0, 1].legend(fontsize=17)
+    
+    
+
+    #Longitude derivative
+    axes[1,1].fill_between(binned_x_upper_lon, d_lower_lon, d_upper_lon, color='#CC79A7', alpha =.5, label='Simulated (binned middle 90%)')
+    axes[1,1].plot(binned_x_median_lon, d_median_lon, marker='.', linestyle='-', color='#CC79A7', label='Simulated median(binned)')
+    axes[1,1].plot(binned_x_lon, dy_lon, marker='.', linestyle='-', color='#0072B2', label='Observed (binned)')
+    # axes[1,1].set_yscale('log')
+    axes[1,1].set_xlabel('Longitude (degrees)', fontsize=17)
+    axes[1,1].set_ylabel('CDF Slope', fontsize=17)
+    axes[1,1].set_title('CDF Slope of Longitude: ' + title, fontsize=18)
+    axes[1,1].tick_params(axis='both', labelsize=15)
+    axes[1,1].grid()
+    axes[1,1].legend(fontsize=17)
 
     plt.tight_layout()
     plt.show()
